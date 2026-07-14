@@ -85,10 +85,10 @@ class UltraBot:
 
     def load_config(self):
         defaults = {
-            "API_ID": "367859",
-            "API_HASH": "bf8ce0c575b02e5ce444b0e7ea8",
-            "BOT_TOKEN": "8641907928:AAEm-2QuuAX6hu_VqCjZjpbGwnhQhXO5Zq0",
-            "ADMIN_IDS": [7302427268,8627378748],
+            "API_ID": "27423048",
+            "API_HASH": "768833ab34cd730e546049662056809e",
+            "BOT_TOKEN": "8641907928:AAFX9zWD-z6nnoU9oN7o3ctbitjlikOefdM",
+            "ADMIN_IDS": [7302427268, 8627378748],
             "ADMIN_PASSWORD": "none",
             "SESSION_TIMEOUT": 3600,
             "MAX_RETRIES": 5,
@@ -3705,9 +3705,37 @@ async def h_text(event):
 #                        MAIN
 # ═══════════════════════════════════════════════════════════
 
+async def sqlite_session_to_string(session_path: str, api_id: int, api_hash: str) -> str | None:
+    """Convert SQLite .session file to Telethon StringSession"""
+    try:
+        from telethon.sessions import SQLiteSession, StringSession
+        # Create client using the SQLite session file path (without .session ext)
+        path_no_ext = session_path.replace('.session', '')
+        import shutil, tempfile
+        tmp = tempfile.mkdtemp()
+        tmp_session = os.path.join(tmp, 'conv')
+        shutil.copy2(session_path, tmp_session + '.session')
+        try:
+            client = TelegramClient(tmp_session, api_id, api_hash)
+            await client.connect()
+            if await client.is_user_authorized():
+                string = StringSession.save(client.session)
+                await client.disconnect()
+                shutil.rmtree(tmp, ignore_errors=True)
+                return string
+            await client.disconnect()
+        except Exception:
+            pass
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None
+    except Exception as e:
+        log.error(f"sqlite_to_string error: {e}")
+        return None
+
+
 async def h_zip_file(event):
-    """Handle ZIP file uploads for session import"""
-    uid  = event.sender_id
+    """Handle ZIP file uploads — supports multiple SQLite .session files"""
+    uid   = event.sender_id
     if not bot.is_admin(uid) or not bot.is_authenticated(uid):
         return
     state = bot.user_states.get(uid, {})
@@ -3715,89 +3743,92 @@ async def h_zip_file(event):
         return
 
     import zipfile, tempfile, shutil
-    from telethon.sessions import StringSession
 
-    doc  = event.document
-    name = state.get('name', f'acc_{uid}')
-
-    # Check if it's a ZIP
+    doc       = event.document
     file_name = doc.attributes[0].file_name if doc.attributes else ''
     if not file_name.lower().endswith('.zip'):
         await event.reply("❌ Sirf ZIP file bhejo!", buttons=kb_back())
         return
 
     msg_obj = await event.reply("⏳ ZIP download ho raha hai...")
-
-    tmp_dir = tempfile.mkdtemp()
-    zip_path = os.path.join(tmp_dir, 'session.zip')
+    tmp_dir  = tempfile.mkdtemp()
+    zip_path = os.path.join(tmp_dir, 'upload.zip')
 
     try:
-        # Download ZIP
         await bot.bot_client.download_media(event.message, zip_path)
         await msg_obj.edit("📦 ZIP extract ho raha hai...")
 
-        # Extract ZIP
         with zipfile.ZipFile(zip_path, 'r') as zf:
             zf.extractall(tmp_dir)
 
-        # Find .session file
-        session_file = None
+        # Find ALL .session files
+        session_files = []
         for root, dirs, files in os.walk(tmp_dir):
             for f in files:
-                if f.endswith('.session') and f != 'session.zip':
-                    session_file = os.path.join(root, f)
-                    break
-            if session_file:
-                break
+                if f.endswith('.session'):
+                    session_files.append(os.path.join(root, f))
 
-        if not session_file:
+        if not session_files:
             await msg_obj.edit(
-                "❌ ZIP mein `.session` file nahi mili!\n\n"
-                "ZIP mein yeh hona chahiye:\n"
-                "• `account.session` file\n"
-                "• Ya session string wali koi `.session` file",
+                "❌ ZIP mein koi `.session` file nahi mili!",
                 buttons=kb_main()
             )
             del bot.user_states[uid]
             return
 
-        await msg_obj.edit("🔑 Session verify ho rahi hai...")
+        total   = len(session_files)
+        success = 0
+        failed  = 0
+        results = []
 
-        # Read session - try as SQLite first, then as string
-        session_str = None
-        try:
-            import sqlite3
-            conn = sqlite3.connect(session_file)
-            cur  = conn.cursor()
-            cur.execute("SELECT session_id FROM sessions LIMIT 1")
-            row = cur.fetchone()
-            conn.close()
-            if row:
-                session_str = row[0]
-        except Exception:
-            pass
+        await msg_obj.edit(f"🔑 {total} sessions verify ho rahi hain... 0/{total}")
 
-        # If SQLite didn't work, try reading as text/string
-        if not session_str:
+        api_id   = int(bot.config['API_ID'])
+        api_hash = bot.config['API_HASH']
+
+        for i, sf in enumerate(session_files, 1):
+            acc_name = os.path.basename(sf).replace('.session', '')
             try:
-                with open(session_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read().strip()
-                    if len(content) > 50:
-                        session_str = content
-            except Exception:
-                pass
+                # Convert SQLite session to StringSession
+                string = await sqlite_session_to_string(sf, api_id, api_hash)
+                if string:
+                    ok, rmsg = await bot.add_account_from_session(acc_name, string)
+                    if ok:
+                        success += 1
+                        results.append(f"✅ `{acc_name}`")
+                    else:
+                        failed += 1
+                        results.append(f"❌ `{acc_name}` — {rmsg[:40]}")
+                else:
+                    failed += 1
+                    results.append(f"⚠️ `{acc_name}` — Expired/Invalid")
+            except Exception as e:
+                failed += 1
+                results.append(f"❌ `{acc_name}` — {str(e)[:40]}")
 
-        if not session_str:
-            await msg_obj.edit(
-                "❌ Session file se data nahi nikla!\n"
-                "Manually session string paste karo (`📤 Import Session` use karo).",
-                buttons=kb_main()
-            )
-            del bot.user_states[uid]
-            return
+            # Update progress every 3
+            if i % 3 == 0 or i == total:
+                try:
+                    await msg_obj.edit(
+                        f"⏳ Processing... {i}/{total}\n"
+                        f"✅ {success} added | ❌ {failed} failed"
+                    )
+                except Exception:
+                    pass
 
-        ok, result_msg = await bot.add_account_from_session(name, session_str)
-        await msg_obj.edit(result_msg, buttons=kb_main())
+        # Final result
+        summary = '\n'.join(results[:30])  # max 30 lines
+        if len(results) > 30:
+            summary += f"\n... aur {len(results)-30} accounts"
+
+        await msg_obj.edit(
+            f"📦 **ZIP Import Complete!**\n\n"
+            f"📊 Total  : {total}\n"
+            f"✅ Added  : {success}\n"
+            f"❌ Failed : {failed}\n\n"
+            f"{summary}",
+            buttons=kb_main()
+        )
         del bot.user_states[uid]
 
     except zipfile.BadZipFile:
